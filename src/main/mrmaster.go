@@ -7,7 +7,7 @@ package main
 // go run mrmaster.go pg*.txt
 //
 
-import "mr"
+import "Mit6824/src/mr"
 import "time"
 import "os"
 import "fmt"
