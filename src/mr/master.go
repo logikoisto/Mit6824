@@ -1,8 +1,10 @@
 package mr
 
-import "log"
+import (
+	"log"
+	"os"
+)
 import "net"
-import "os"
 import "net/rpc"
 import "net/http"
 
@@ -53,7 +55,7 @@ func (m *Master) Done() bool {
 //
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
-
+	m.server()
 	// Your code here.
 
 	return &m

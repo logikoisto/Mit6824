@@ -25,7 +25,7 @@ go run mrmaster.go pg-*.txt
 2. `mrmaster.go`会调用你编写的 `src/mr/master.go`代码
 3. `mrworker.go`会调用`src/mr/worker.go`的代码
 4. 二者通信的代码在`src/mr/rpc.go`中自行实现
-5. 我已经经完成了实验代码,在`src/mroriginal`目录下有原始的实验框架是我留给你来独立完成的
+5. 我已经完成了实验代码,在`src/mroriginal`目录下有原始的实验框架是我留给你来独立完成的
 6. 将mr文件夹进行覆盖即可:`mv src/mroriginal src/mr` 或者备份下留作参考😁
 
 **ps:在`src/mrapps`目录下的是**MR**相关的应用函数**
