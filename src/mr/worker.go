@@ -2,6 +2,7 @@ package mr
 
 import (
 	"fmt"
+	"time"
 )
 import "log"
 import "net/rpc"
@@ -25,18 +26,45 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+var workerID uint64
+
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-
 	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the master.
-	CallExample()
+	workerID = Register()
+	go func() {
+		timer := time.NewTimer(10 * time.Second)
+		defer timer.Stop()
+		for {
+			<-timer.C
+			PingPong()
+		}
+	}()
+	for {
+		// 1.获取任务
+		task := GetTask()
+		// 2.根据任务类型执行任务
+		// TODO: 是否应该用err 来返回 这样更优雅?
+		res := ExecTask(mapf, reducef, task)
+		if res == nil {
+			break
+		}
+		// 3.报告结果
+		Report(res)
+	}
 }
 
 //
 // example function to show how to make an RPC call to the master.
 //
+
+const (
+	CallRegister = "Master.RegisterWorker"
+	CallPingPong = "Master.Health"
+	CallGetTask  = "Master.GetTaskWorker"
+	CallReport   = "Master.ReportResult"
+)
+
 func CallExample() {
 
 	// declare an argument structure.
@@ -53,6 +81,50 @@ func CallExample() {
 
 	// reply.Y should be 100.
 	fmt.Printf("reply.Y %v\n", reply.Y)
+}
+
+// TODO: 是否可以包装成对象
+func Register() uint64 {
+	args, reply := RegisterReq{}, RegisterRes{}
+	// TODO: 处理请求异常?
+	call(CallRegister, &args, &reply)
+	return reply.WorkerID
+}
+func PingPong() {
+	args, reply := Ping{WorkerID: workerID}, Pong{}
+	call(CallPingPong, &args, &reply)
+	//TODO:解析PingPong异常?
+}
+func GetTask() *Task {
+	args, reply := GetTaskReq{WorkerID: workerID}, GetTaskRes{}
+	call(CallGetTask, &args, &reply)
+	//TODO:解析异常?
+	return reply.T
+}
+
+func ExecTask(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string, task *Task) *ResultReq {
+	if task.Type == 0 {
+		// TODO: 执行 map 任务
+		_ = doMap(mapf, task)
+	} else if task.Type == 1 {
+		// TODO: 执行 reduce 任务
+		_ = doReduce(reducef, task)
+	}
+	return nil
+}
+
+func Report(res *ResultReq) {
+	reply := ResultRes{}
+	call(CallReport, res, &reply)
+	//TODO:处理返回异常?
+}
+
+func doMap(mapf func(string, string) []KeyValue, task *Task) error {
+	return nil
+}
+func doReduce(reducef func(string, []string) string, task *Task) error {
+	return nil
 }
 
 //
