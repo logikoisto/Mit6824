@@ -36,6 +36,16 @@ type GetTaskRes struct {
 	T    *Task
 }
 
+// 重新获取任务
+type ReTryTaskReq struct {
+	WorkerID uint64
+}
+type ReTryTaskRes struct {
+	Code int
+	Msg  string
+	T    *Task
+}
+
 // 返回结果
 type ResultReq struct {
 	WorkerID uint64
