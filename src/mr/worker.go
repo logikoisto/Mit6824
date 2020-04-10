@@ -15,12 +15,13 @@ import "net/rpc"
 import "hash/fnv"
 
 /*
-	debug:
+	TODO: debug:
 		1. 消息通信的类型定义复杂 没有处理好 导致逻辑混乱调用
 		2. reduce 任务无法输出全部数据 -> 更改了 状态矩阵的更新逻辑 导致的 偶然复杂度
 		3. job 执行后无法正常关闭
 				1. 资源释放不协调导致泄露
 				2. 消息通信协议没有定义好 导致逻辑混乱
+		4. reduce 输出内容 多个文件都是一样的
 */
 //
 // Map functions return a slice of KeyValue.
