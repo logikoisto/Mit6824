@@ -179,10 +179,10 @@ func (m *Master) ReportResult(args *ResultReq, reply *ResultRes) error {
 func (m *Master) ReTry(args *ReTryTaskReq, reply *ReTryTaskRes) {
 	if worker, ok := m.W.Load(args.WorkerID); ok {
 		w := worker.(*WorkerSession)
+		w.Mux.RLock()
+		defer w.Mux.RUnlock()
 		reply.T = w.T
 		reply.Code = 0
-		w.Mux.Lock()
-		defer w.Mux.Unlock()
 	}
 }
 
@@ -228,11 +228,10 @@ func (d *Dispatcher) cleanSession() {
 
 func (d *Dispatcher) updateJobState() {
 	for rs := range d.ReduceSourceChan {
-		for i, source := range rs.MapSource {
-			d.M.S.MatrixSource[rs.MIdx][i] = source
-		}
+		d.M.S.MatrixSource[rs.MIdx] = rs.MapSource
 		sources := make([]string, 0)
 		// TODO 这里会有重复计算问题
+		// TODO 将这里改为 计数统计 m 任务的完成
 		for j := 0; j < d.M.S.RC; j++ {
 			for i := 0; i < d.M.S.MC; i++ {
 				if len(d.M.S.MatrixSource[i][j]) != 0 {
