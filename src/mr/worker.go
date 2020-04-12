@@ -14,26 +14,6 @@ import "log"
 import "net/rpc"
 import "hash/fnv"
 
-/*
-	TODO: debug:
-		1. 消息通信的类型定义复杂 没有处理好 导致逻辑混乱调用
-		2. reduce 任务无法输出全部数据 -> 更改了 状态矩阵的更新逻辑 导致的 偶然复杂度
-		3. job 执行后无法正常关闭
-				1. 资源释放不协调导致泄露
-				2. 消息通信协议没有定义好 导致逻辑混乱
-		4. reduce 输出内容 多个文件都是一样的
-
-		现象: job 无法执行全部的r任务 而之前能够全部执行并输出
-		期望: job 正常输出全部 结果文件
-		问题: job 执行逻辑哪里出了问题?
-
-		w没有获取到r任务
-		sm 的状态是正确的
-		假设 生成r任务时出现错误
-				统计done时出现错误
-
-		假设 m的提交是在一行上保持原子性  所以 m 正确提交只会是 mc 次
-*/
 //
 // Map functions return a slice of KeyValue.
 //
@@ -74,26 +54,17 @@ func Worker(mapf func(string, string) []KeyValue,
 			PingPong()
 		}
 	}()
-	var isRetry bool
 	var task *Task
 	for {
 		// 1.获取任务
-		if isRetry {
-			task = ReTryTask()
-		} else {
-			task = GetTask()
-		}
+		task = GetTask()
 		// 2.根据任务类型执行任务
-		// TODO: 是否应该用err 来返回 这样更优雅?
 		res, err := ExecTask(mapf, reducef, task)
 		if err != nil {
-			isRetry = true
 			continue
 		}
 		// 3.报告结果
 		Report(res)
-		// TODO 解析结果 在来判断是否需要 重新获取 task
-		isRetry = false
 	}
 }
 
@@ -106,7 +77,6 @@ const (
 	CallPingPong = "Master.Health"
 	CallGetTask  = "Master.GetTaskWorker"
 	CallReport   = "Master.ReportResult"
-	CallReTry    = "Master.ReTry"
 )
 
 func CallExample() {
@@ -145,16 +115,13 @@ func GetTask() *Task {
 	//TODO:解析异常?
 	return reply.T
 }
-func ReTryTask() *Task {
-	args, reply := ReTryTaskReq{WorkerID: workerID}, ReTryTaskRes{}
-	call(CallReTry, &args, &reply)
-	//TODO:解析异常?
-	return reply.T
-}
 func ExecTask(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string, task *Task) (*ResultReq, error) {
 	var res []string
 	req := &ResultReq{WorkerID: workerID}
+	if task == nil {
+		return nil, fmt.Errorf("retry") // TODO:应该定义一种错误类型
+	}
 	if task.Type == 0 {
 		// TODO: 执行 map 任务
 		res, _ = doMap(mapf, task)
@@ -163,8 +130,6 @@ func ExecTask(mapf func(string, string) []KeyValue,
 		// TODO: 执行 reduce 任务
 		res, _ = doReduce(reducef, task)
 		req.Code = 1
-	} else if task.Type == 2 {
-		return nil, fmt.Errorf("retry") // TODO:应该定义一种错误类型
 	}
 	if len(res) == 0 {
 		return nil, fmt.Errorf("retry") // TODO:应该定义一种错误类型
@@ -196,14 +161,14 @@ func doMap(mapf func(string, string) []KeyValue, task *Task) ([]string, error) {
 	}
 	cacheMap := make(map[string][]KeyValue, 0)
 	for i := 0; i < task.Conf.RC; i++ {
-		key := fmt.Sprintf("mid-%d-%d.out", task.Conf.MNum, i)
+		key := fmt.Sprintf("mr-worker-%d-%d.out", task.Conf.MNum, i)
 		cacheMap[key] = []KeyValue{}
 		res = append(res, key)
 	}
 	kva := mapf(fileName, string(content))
 	for i := 0; i < len(kva); i++ {
 		idx := ihash(kva[i].Key) % task.Conf.RC // TODO: ihash(kva[i].Key) & (task.Conf.RC - 1)
-		key := fmt.Sprintf("mid-%d-%d.out", task.Conf.MNum, idx)
+		key := fmt.Sprintf("mr-worker-%d-%d.out", task.Conf.MNum, idx)
 		cacheMap[key] = append(cacheMap[key], kva[i])
 	}
 
@@ -228,27 +193,39 @@ func doReduce(reducef func(string, []string) string, task *Task) ([]string, erro
 	tmpFileName := fmt.Sprintf("mr-out-%d.%d.swap", time.Now().Unix(), task.Conf.RNum)
 	outFile, _ := os.OpenFile(tmpFileName, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0664)
 	defer outFile.Close()
-	// TODO: 检查 kvas
+	// TODO:先在内存排个顺序
+	sort.Sort(ByKey(kvas))
+	// TODO: 先这样处理
+	if len(kvas) == 0 {
+		key := fmt.Sprintf("mr-out-%d", task.Conf.RNum)
+		_ = os.Rename(tmpFileName, key)
+		return []string{key}, nil
+	}
 	buf := []KeyValue{kvas[0]}
 	// TODO:处理边界
-	for i := 1; i < len(kvas)-1; i++ {
-		if buf[len(buf)-1].Key == kvas[i].Key {
+	// [a,a,a,a,a,b,b,b,b,c,c,c]
+	for i := 1; i < len(kvas); i++ {
+		if buf[len(buf)-1].Key == kvas[i].Key { // buf 中最后的一个key 与当前key 相同
 			buf = append(buf, kvas[i])
 		} else {
-			out := reducef(buf[0].Key, toValues(buf))
-			_, _ = fmt.Fprintf(outFile, "%v %v\n", buf[0].Key, out)
+			out := reducef(buf[len(buf)-1].Key, toValues(buf))
+			_, _ = fmt.Fprintf(outFile, "%v %v\n", buf[len(buf)-1].Key, out)
 			buf = []KeyValue{kvas[i]}
 		}
 	}
+	// 写入最后的buf进去
+	out := reducef(buf[len(buf)-1].Key, toValues(buf))
+	_, _ = fmt.Fprintf(outFile, "%v %v\n", buf[len(buf)-1].Key, out)
 	//TODO:处理路径问题?
 	key := fmt.Sprintf("mr-out-%d", task.Conf.RNum)
 	_ = os.Rename(tmpFileName, key)
 	return []string{key}, nil
 }
 
-func toValues(kvas []KeyValue) (res []string) {
-	for i := 0; i < len(kvas); i++ {
-		res = append(res, kvas[i].Value)
+func toValues(kvas []KeyValue) []string {
+	res := make([]string, 0)
+	for _, kv := range kvas {
+		res = append(res, kv.Value)
 	}
 	return res
 }

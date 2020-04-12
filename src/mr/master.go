@@ -13,9 +13,10 @@ import "net/rpc"
 import "net/http"
 
 /*
-debug:
-	1. desc: map 的并发写入报错 fix: 改成 sync.map 结构
-	2. desc: map 任务执行完 并不上报 完成状态 给master
+	TODO:
+		现象   map任务无法上报完成,生成不了reduce任务
+		期望	  在崩溃下正常执行
+		假设   容错机制没有写好,心跳超时后没有将任务进行正确调度
 */
 
 // 主节点
@@ -32,6 +33,7 @@ type JobState struct {
 	MatrixSource [][]string // MC * RC
 	MC           int
 	RC           int
+	MCDone       int32
 	nextWorkerID uint64
 }
 
@@ -109,33 +111,28 @@ func (m *Master) GetTaskWorker(args *GetTaskReq, reply *GetTaskRes) error {
 	// TODO: 应该先判断是否合法再去拿任务
 	// 延迟 5秒后 若五任务就返回
 	c := time.After(5 * time.Second)
-	select {
-	case task, ok := <-m.TP.Pool:
-		if !ok {
-			shutdown(reply)
-			return nil
-		}
-		workerID := args.WorkerID
-		if worker, ok := m.W.Load(workerID); ok {
-			w := worker.(*WorkerSession)
+	if worker, ok := m.W.Load(args.WorkerID); ok {
+		w := worker.(*WorkerSession)
+		select {
+		case task, ok := <-m.TP.Pool:
+			if !ok {
+				shutdown(reply)
+				return nil
+			}
 			reply.T = task
 			w.Mux.Lock()
 			defer w.Mux.Unlock()
 			w.Status = 1 // 任务负载
 			w.T = task
-		} else {
-			m.TP.Pool <- task
-			reply.Msg = "unregistered"
-			reply.Code = 1
+		case <-c:
+			// 返回nil
 		}
-	case <-c:
-		reTry(reply)
 	}
 	return nil
 }
 
 func (m *Master) ReportResult(args *ResultReq, reply *ResultRes) error {
-	fmt.Println("ReportResult", args.WorkerID, args.M, args.Code)
+	//fmt.Println("ReportResult", args.WorkerID, args.M, args.Code)
 	if len(args.M) == 0 {
 		reply.Code = 1
 		reply.Msg = "The report cannot be empty"
@@ -176,16 +173,6 @@ func (m *Master) ReportResult(args *ResultReq, reply *ResultRes) error {
 	return nil
 }
 
-func (m *Master) ReTry(args *ReTryTaskReq, reply *ReTryTaskRes) {
-	if worker, ok := m.W.Load(args.WorkerID); ok {
-		w := worker.(*WorkerSession)
-		w.Mux.RLock()
-		defer w.Mux.RUnlock()
-		reply.T = w.T
-		reply.Code = 0
-	}
-}
-
 func (m *Master) Health(args *Ping, reply *Pong) error {
 	_ = args
 	if ws, ok := m.W.Load(args.WorkerID); ok {
@@ -206,20 +193,14 @@ func shutdown(reply *GetTaskRes) {
 		Conf:   &TaskConf{Source: []string{}},
 	}
 }
-func reTry(reply *GetTaskRes) {
-	reply.Msg = "reTry!!!"
-	reply.T = &Task{
-		Status: 0,
-		Type:   2,
-		Conf:   &TaskConf{Source: []string{}},
-	}
-}
 
+// TODO: 用协程通信实现 延迟效果
 func (d *Dispatcher) cleanSession() {
 	curTs := time.Now().UnixNano() / 1e6
 	d.M.W.Range(func(k, v interface{}) bool {
 		worker, workerID := v.(*WorkerSession), k.(uint64)
-		if curTs-worker.LastPingTs > int64(10*time.Millisecond) {
+		if curTs-worker.LastPingTs > int64(10*time.Second) {
+			fmt.Println("worker", worker.T.Status, "workerID", workerID, "Status", worker.Status)
 			d.M.W.Delete(workerID)
 		}
 		return true
@@ -229,16 +210,14 @@ func (d *Dispatcher) cleanSession() {
 func (d *Dispatcher) updateJobState() {
 	for rs := range d.ReduceSourceChan {
 		d.M.S.MatrixSource[rs.MIdx] = rs.MapSource
-		sources := make([]string, 0)
-		// TODO 这里会有重复计算问题
-		// TODO 将这里改为 计数统计 m 任务的完成
-		for j := 0; j < d.M.S.RC; j++ {
-			for i := 0; i < d.M.S.MC; i++ {
-				if len(d.M.S.MatrixSource[i][j]) != 0 {
+		atomic.AddInt32(&d.M.S.MCDone, 1)
+		fmt.Println(d.M.S.MCDone)
+		if atomic.LoadInt32(&d.M.S.MCDone) == int32(d.M.S.MC) {
+			for j := 0; j < d.M.S.RC; j++ {
+				sources := make([]string, 0)
+				for i := 0; i < d.M.S.MC; i++ {
 					sources = append(sources, d.M.S.MatrixSource[i][j])
 				}
-			}
-			if len(d.M.S.MatrixSource[d.M.S.MC][j]) == 0 && len(sources) == d.M.S.MC {
 				d.M.TP.Pool <- &Task{
 					Status: 0,
 					Type:   1, // Reduce 任务
