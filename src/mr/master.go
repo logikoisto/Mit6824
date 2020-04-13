@@ -12,12 +12,7 @@ import "net"
 import "net/rpc"
 import "net/http"
 
-/*
-	TODO:
-		现象   map任务无法上报完成,生成不了reduce任务
-		期望	  在崩溃下正常执行
-		假设   容错机制没有写好,心跳超时后没有将任务进行正确调度
-*/
+var dispatcher *Dispatcher
 
 // 主节点
 type Master struct {
@@ -25,7 +20,6 @@ type Master struct {
 	S  *JobState
 	TP *TaskPool
 	W  *sync.Map
-	D  *Dispatcher
 }
 
 // Job 状态
@@ -59,17 +53,20 @@ type TaskConf struct {
 
 // 定时清理器
 type Dispatcher struct {
-	PollTs           time.Duration      //毫秒
+	TimeOut          time.Duration      //默认10秒
 	M                *Master            //主节点全局结构
 	ReduceSourceChan chan *ReduceSource // 发送 reduce 的任务 执行内容
+	CleanWorkerChan  chan uint64        // 清理失效的worker
 }
 
 // 工作者会话管理器
 type WorkerSession struct {
-	Status     int // 0 空闲状态 1 工作状态 2 无法正常工作
-	T          *Task
-	Mux        *sync.RWMutex
-	LastPingTs int64
+	WorkerID     uint64
+	Status       int // 0 空闲状态 1 工作状态 2 无法正常工作
+	T            *Task
+	Mux          *sync.RWMutex
+	LastPingTs   int64
+	PingPongChan chan struct{}
 }
 
 type ReduceSource struct {
@@ -94,12 +91,15 @@ func (m *Master) RegisterWorker(args *RegisterReq, reply *RegisterRes) error {
 		if atomic.CompareAndSwapUint64(&m.S.nextWorkerID, assignID, assignID+1) {
 			reply.WorkerID = assignID
 			ws := &WorkerSession{
-				Status:     0,   // 0 代表 健康良好 1 代表失联
-				T:          nil, // 正在执行的任务
-				LastPingTs: time.Now().UnixNano() / 1e6,
-				Mux:        &sync.RWMutex{},
+				WorkerID:     assignID,
+				Status:       0,   // 0 代表 健康良好 1 代表失联
+				T:            nil, // 正在执行的任务
+				LastPingTs:   time.Now().UnixNano() / 1e6,
+				Mux:          &sync.RWMutex{},
+				PingPongChan: make(chan struct{}),
 			}
 			m.W.Store(assignID, ws)
+			go ws.PingPong(dispatcher.TimeOut)
 			return nil
 		}
 		// TODO:不应该无限重试 应该设置一个限制
@@ -108,7 +108,6 @@ func (m *Master) RegisterWorker(args *RegisterReq, reply *RegisterRes) error {
 }
 
 func (m *Master) GetTaskWorker(args *GetTaskReq, reply *GetTaskRes) error {
-	// TODO: 应该先判断是否合法再去拿任务
 	// 延迟 5秒后 若五任务就返回
 	c := time.After(5 * time.Second)
 	if worker, ok := m.W.Load(args.WorkerID); ok {
@@ -119,6 +118,7 @@ func (m *Master) GetTaskWorker(args *GetTaskReq, reply *GetTaskRes) error {
 				shutdown(reply)
 				return nil
 			}
+			task.Status = 1
 			reply.T = task
 			w.Mux.Lock()
 			defer w.Mux.Unlock()
@@ -142,11 +142,21 @@ func (m *Master) ReportResult(args *ResultReq, reply *ResultRes) error {
 		w := ws.(*WorkerSession)
 		switch args.Code {
 		case 0: // map
-			m.D.ReduceSourceChan <- &ReduceSource{
+			if w.T == nil {
+				reply.Msg = "shut down!!!"
+				reply.Code = 1
+				return nil
+			}
+			dispatcher.ReduceSourceChan <- &ReduceSource{
 				MIdx:      w.T.Conf.MNum,
 				MapSource: args.M,
 			}
 		case 1: // reduce
+			if w.T == nil {
+				reply.Msg = "shut down!!!"
+				reply.Code = 1
+				return nil
+			}
 			m.S.MatrixSource[m.S.MC][w.T.Conf.RNum] = "done"
 		case 2: // failed
 			task := w.T
@@ -173,13 +183,13 @@ func (m *Master) ReportResult(args *ResultReq, reply *ResultRes) error {
 	return nil
 }
 
-func (m *Master) Health(args *Ping, reply *Pong) error {
-	_ = args
+func (m *Master) PingPong(args *Ping, reply *Pong) error {
 	if ws, ok := m.W.Load(args.WorkerID); ok {
 		w := ws.(*WorkerSession)
 		w.Mux.Lock()
 		defer w.Mux.Unlock()
 		w.LastPingTs = time.Now().UnixNano() / 1e6 // 更新会话时间戳
+		w.PingPongChan <- struct{}{}
 	}
 	reply.Code = 0
 	return nil
@@ -194,25 +204,31 @@ func shutdown(reply *GetTaskRes) {
 	}
 }
 
-// TODO: 用协程通信实现 延迟效果
 func (d *Dispatcher) cleanSession() {
-	curTs := time.Now().UnixNano() / 1e6
-	d.M.W.Range(func(k, v interface{}) bool {
-		worker, workerID := v.(*WorkerSession), k.(uint64)
-		if curTs-worker.LastPingTs > int64(10*time.Second) {
-			fmt.Println("worker", worker.T.Status, "workerID", workerID, "Status", worker.Status)
-			d.M.W.Delete(workerID)
+	for workerID := range d.CleanWorkerChan {
+		if w, ok := d.M.W.Load(workerID); ok {
+			worker := w.(*WorkerSession)
+			worker.Mux.Lock()
+			task := worker.T
+			worker.T = nil
+			worker.Mux.Unlock()
+			if task != nil {
+				task.Status = 0
+				//fmt.Println("cleanSession.task",workerID,task.Status,task.Conf.Source)
+				d.M.TP.Pool <- task
+			}
+			d.M.W.Delete(worker)
+			//fmt.Println("cleanSession.worker",workerID)
 		}
-		return true
-	})
+	}
 }
 
 func (d *Dispatcher) updateJobState() {
 	for rs := range d.ReduceSourceChan {
 		d.M.S.MatrixSource[rs.MIdx] = rs.MapSource
 		atomic.AddInt32(&d.M.S.MCDone, 1)
-		fmt.Println(d.M.S.MCDone)
 		if atomic.LoadInt32(&d.M.S.MCDone) == int32(d.M.S.MC) {
+			//fmt.Println(d.M.S.MCDone)
 			for j := 0; j < d.M.S.RC; j++ {
 				sources := make([]string, 0)
 				for i := 0; i < d.M.S.MC; i++ {
@@ -229,23 +245,27 @@ func (d *Dispatcher) updateJobState() {
 					},
 				}
 				d.M.S.MatrixSource[d.M.S.MC][j] = "created"
+				//fmt.Println(sources, d.M.S.MatrixSource[d.M.S.MC][j])
 			}
 		}
 	}
 }
 
 func (d *Dispatcher) run() {
-	go func() {
-		timer := time.NewTicker(d.PollTs)
-		defer timer.Stop()
-		for {
-			// TODO:这里存在资源泄露的问题
-			<-timer.C
-			d.cleanSession()
-		}
-	}()
-
+	go d.cleanSession()
 	go d.updateJobState()
+}
+
+func (w *WorkerSession) PingPong(ts time.Duration) {
+	for {
+		tc := time.NewTicker(ts)
+		select {
+		case _ = <-tc.C:
+			dispatcher.CleanWorkerChan <- w.WorkerID
+		case _ = <-w.PingPongChan:
+			tc.Stop()
+		}
+	}
 }
 
 //
@@ -284,8 +304,9 @@ func (m *Master) Done() bool {
 	}
 	if count == m.S.RC {
 		ret = true
-		close(m.D.ReduceSourceChan)
-		close(m.TP.Pool) // 将会通知所有 worker 进行下线
+		//close(dispatcher.CleanWorkerChan)
+		//close(dispatcher.ReduceSourceChan)
+		//close(m.TP.Pool) // 将会通知所有 worker 进行下线
 	}
 	return ret
 }
@@ -310,13 +331,13 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m.TP = &TaskPool{Pool: make(chan *Task, len(files))}
 	m.W = &sync.Map{}
 
-	dispatcher := &Dispatcher{
-		PollTs:           1 * time.Second,
+	dispatcher = &Dispatcher{
+		TimeOut:          10 * time.Second,
 		M:                &m,
 		ReduceSourceChan: make(chan *ReduceSource, nReduce),
+		CleanWorkerChan:  make(chan uint64, len(files)),
 	}
 	dispatcher.run()
-	m.D = dispatcher // 将 master 与 dispatcher 进行相互关联以便于传递新秀
 	// 初始化map任务
 	for num, file := range files {
 		m.TP.Pool <- &Task{

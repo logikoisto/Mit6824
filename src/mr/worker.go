@@ -47,10 +47,10 @@ func Worker(mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 	workerID = Register()
 	go func() {
-		timer := time.NewTimer(10 * time.Second)
-		defer timer.Stop()
+		tc := time.NewTicker(10 * time.Second)
+		defer tc.Stop()
 		for {
-			<-timer.C
+			<-tc.C
 			PingPong()
 		}
 	}()
@@ -74,7 +74,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 const (
 	CallRegister = "Master.RegisterWorker"
-	CallPingPong = "Master.Health"
+	CallPingPong = "Master.PingPong"
 	CallGetTask  = "Master.GetTaskWorker"
 	CallReport   = "Master.ReportResult"
 )

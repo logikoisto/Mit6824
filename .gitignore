@@ -2,3 +2,4 @@ pkg/
 api.key
 *-handin.tar.gz
 .idea
+src/main/test-mr.sh
