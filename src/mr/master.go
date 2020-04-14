@@ -29,6 +29,7 @@ type JobState struct {
 	RC           int
 	MCDone       int32
 	nextWorkerID uint64
+	allDone      int // 用于标示全部完成的状态 0代表没有全部完成 1 代表已经全部完成 进入优雅关闭状态
 }
 
 // 任务池
@@ -116,6 +117,7 @@ func (m *Master) GetTaskWorker(args *GetTaskReq, reply *GetTaskRes) error {
 		case task, ok := <-m.TP.Pool:
 			if !ok {
 				shutdown(reply)
+				m.W.Delete(w.WorkerID)
 				return nil
 			}
 			task.Status = 1
@@ -127,6 +129,9 @@ func (m *Master) GetTaskWorker(args *GetTaskReq, reply *GetTaskRes) error {
 		case <-c:
 			// 返回nil
 		}
+	} else {
+		shutdown(reply)
+		m.W.Delete(args.WorkerID)
 	}
 	return nil
 }
@@ -303,10 +308,30 @@ func (m *Master) Done() bool {
 		}
 	}
 	if count == m.S.RC {
-		ret = true
+		//fmt.Println(m.S.allDone)
 		//close(dispatcher.CleanWorkerChan)
 		//close(dispatcher.ReduceSourceChan)
-		//close(m.TP.Pool) // 将会通知所有 worker 进行下线
+		if len(m.TP.Pool) != 0 {
+			return false
+		}
+		if m.S.allDone == 0 {
+			close(m.TP.Pool) // 将会通知所有 worker 进行下线
+			m.S.allDone = 1
+		}
+		c := 0
+		m.W.Range(func(key, value interface{}) bool {
+			w := value.(*WorkerSession)
+			if w.T != nil {
+				c++
+			}
+			return true
+		})
+		if c == 0 {
+			ret = true
+			// TODO: 一个完美主义者 不想让命令行打印出来一些无关紧要的东西(又不想改框架本身)
+			_ = os.Remove("mr-socket")
+			_, _ = os.Create("mr-socket")
+		}
 	}
 	return ret
 }
@@ -316,7 +341,6 @@ func (m *Master) Done() bool {
 //
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{}
-	m.server()
 	// Your code here.
 	sources := make([][]string, len(files)+1) // 多出一行保存完成状态
 	for i := 0; i < len(sources); i++ {
@@ -346,5 +370,6 @@ func MakeMaster(files []string, nReduce int) *Master {
 			Conf:   &TaskConf{Source: []string{file}, MNum: num, RNum: -1, RC: nReduce},
 		}
 	}
+	m.server()
 	return &m
 }

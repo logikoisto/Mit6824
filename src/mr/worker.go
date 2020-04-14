@@ -130,6 +130,8 @@ func ExecTask(mapf func(string, string) []KeyValue,
 		// TODO: 执行 reduce 任务
 		res, _ = doReduce(reducef, task)
 		req.Code = 1
+	} else if task.Type == 2 {
+		os.Exit(0)
 	}
 	if len(res) == 0 {
 		return nil, fmt.Errorf("retry") // TODO:应该定义一种错误类型
