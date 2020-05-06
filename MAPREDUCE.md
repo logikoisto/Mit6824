@@ -40,7 +40,7 @@ go run mrmaster.go pg-*.txt
 [请点击这里](http://nil.csail.mit.edu/6.824/2020/labs/lab-mr.html)
 
 ## 通过截图
-![mr](resource/mr.jpeg)
+![mr](resource/mr.png)
 
 ## 总结
 1. 虽然通过了全部测试,但是感觉还有很多地方没有完善 

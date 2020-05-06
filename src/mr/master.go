@@ -269,6 +269,7 @@ func (w *WorkerSession) PingPong(ts time.Duration) {
 			dispatcher.CleanWorkerChan <- w.WorkerID
 		case _ = <-w.PingPongChan:
 			tc.Stop()
+			// TODO: 这里应该 有一个 close 信号将协程退出 否则程序中会存在大量无用的协程 存在泄露的风险
 		}
 	}
 }
