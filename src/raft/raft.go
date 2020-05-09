@@ -17,7 +17,12 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"github.com/google/uuid"
+	"math/rand"
+	"sync"
+	"time"
+)
 import "sync/atomic"
 import "Mit6824/src/labrpc"
 
@@ -50,11 +55,21 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
-
+	closeChan chan struct{}       // 关闭信号
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	// 唯一 持久化的配置
+	isLeader      bool   // 标示当前对等点 是否为leader节点
+	id            string // 对等点唯一标示
+	curVoteTarget string // 当一次投票给node的ID
+	myTerm        int64  // 最后的已知的任期
+	logs          []log  // 日志条目
+	lastCommitIdx int64  // 最后的提交日志索引
+}
+type log struct {
+	term int64
+	cmd  string
 }
 
 // return currentTerm and whether this server
@@ -111,6 +126,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	CandidateID   string
+	CandidateTerm int64
+	LastLogIdx    int
+	LastLogTerm   int64
 }
 
 //
@@ -119,6 +138,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	CurTerm int64
+	IsVote  bool
 }
 
 //
@@ -126,6 +147,16 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	reply.CurTerm = rf.myTerm
+	// TODO: 这样逻辑就完事了？？？
+	// TODO: 进行并发操作 raft状态的改造
+	if args.CandidateTerm < rf.myTerm || len(rf.curVoteTarget) != 0 ||
+		rf.logs[len(rf.logs)-1].term > args.CandidateTerm || len(rf.logs)-1 > args.LastLogIdx {
+		reply.IsVote = false
+		return
+	}
+	reply.IsVote = true
+	return
 }
 
 //
@@ -159,6 +190,33 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+//
+// 附加日志/心跳rpc 请求
+//
+type AppendEntriesArgs struct {
+	// Your data here (2A, 2B).
+}
+
+//
+// 附加日志/心跳 rpc 的回复
+//
+type AppendEntriesReply struct {
+	// Your data here (2A).
+}
+
+//
+// 附加日志/心跳 rpc 的执行体
+//
+func (rf *Raft) RequestAppendEntries(args *RequestVoteArgs, reply *RequestVoteReply) {
+	// Your code here (2A, 2B).
+}
+
+// 附加日志/心跳 rpc 的发送函数
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -223,11 +281,65 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-
+	rf.closeChan = make(chan struct{})
 	// Your initialization code here (2A, 2B, 2C).
-
+	rf.id = uuid.New().String() // TODO: 应该去除特殊字符
+	rf.logs = make([]log, 0)
+	rf.myTerm = 1 // 初始化的时候 大家都认为自己是1,除非 被快照覆盖
+	go rf.election()
+	go rf.heartbeat()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	return rf
+}
+func getElectionTimeOut() time.Duration {
+	rand.Seed(time.Now().UnixNano())
+	return time.Duration(rand.Intn(500)+500) * time.Millisecond
+}
+func (rf *Raft) election() {
+	c := time.NewTimer(getElectionTimeOut())
+	defer c.Stop()
+	for {
+		select {
+		case <-c.C:
+			rf.myTerm++
+			// TODO: 直接操作 raft 状态是否会有并发问题?
+			voteArgs, voteRes := RequestVoteArgs{
+				CandidateID:   rf.id,
+				CandidateTerm: rf.myTerm,
+				LastLogIdx:    len(rf.logs) - 1,
+				LastLogTerm:   rf.logs[len(rf.logs)-1].term,
+			}, RequestVoteReply{}
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+				if ok := rf.sendRequestVote(i, &voteArgs, &voteRes); ok {
+					if voteRes.CurTerm > rf.myTerm {
+						rf.myTerm = voteRes.CurTerm
+						continue
+					}
+					if voteRes.IsVote {
+						rf.isLeader = true
+					}
+				}
+			}
+		case <-rf.closeChan:
+			return
+		}
+		c.Reset(getElectionTimeOut())
+	}
+}
+
+func (rf *Raft) heartbeat() {
+	c := time.NewTicker(100 * time.Millisecond)
+	for {
+		select {
+		case <-c.C:
+			// TODO: 发送心跳
+		case <-rf.closeChan:
+			return
+		}
+	}
 }
