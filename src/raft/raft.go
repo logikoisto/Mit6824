@@ -60,15 +60,75 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	// 唯一 持久化的配置
-	isLeader      bool   // 标示当前对等点 是否为leader节点
-	id            string // 对等点唯一标示
-	curVoteTarget string // 当一次投票给node的ID
-	myTerm        int64  // 最后的已知的任期
-	logs          []log  // 日志条目
-	lastCommitIdx int64  // 最后的提交日志索引
+	isLeader      int32       // 标示当前对等点 是否为leader节点
+	id            string      // 对等点唯一标示
+	curVoteTarget string      // 当一次投票给node的ID
+	myTerm        uint64      // 最后的已知的任期
+	logs          []wal       // 日志条目
+	lastCommitIdx int         // 最后的提交日志索引
+	electionTimer *time.Timer // 用于选举的定时器
 }
-type log struct {
-	term int64
+
+func (rf *Raft) getLastCommitIdx() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.lastCommitIdx
+}
+
+func (rf *Raft) setLogs(los []wal) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.logs = los
+}
+func (rf *Raft) setMyTerm(term uint64) {
+	atomic.StoreUint64(&rf.myTerm, term)
+}
+
+func (rf *Raft) setIsLeader(isLeader int32) {
+	atomic.StoreInt32(&rf.isLeader, isLeader)
+}
+func (rf *Raft) setCurVoteTarget(vote string) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.curVoteTarget = vote
+}
+
+func (rf *Raft) setLastCommitIdx(lastCommitIdx int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.lastCommitIdx = lastCommitIdx
+}
+
+// TODO: 是否存在 一个并发安全的 list?
+func (rf *Raft) getLogs() []wal {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.logs
+}
+func (rf *Raft) getMyTerm() uint64 {
+	return atomic.LoadUint64(&rf.myTerm)
+}
+func (rf *Raft) getMe() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.me
+}
+func (rf *Raft) getIsLeader() int32 {
+	return atomic.LoadInt32(&rf.isLeader)
+}
+func (rf *Raft) getId() string {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.id
+}
+func (rf *Raft) getCurVoteTarget() string {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.curVoteTarget
+}
+
+type wal struct {
+	term uint64
 	cmd  string
 }
 
@@ -127,9 +187,9 @@ func (rf *Raft) readPersist(data []byte) {
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	CandidateID   string
-	CandidateTerm int64
+	CandidateTerm uint64
 	LastLogIdx    int
-	LastLogTerm   int64
+	LastLogTerm   uint64
 }
 
 //
@@ -138,7 +198,7 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	CurTerm int64
+	CurTerm uint64
 	IsVote  bool
 }
 
@@ -147,14 +207,19 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	reply.CurTerm = rf.myTerm
-	// TODO: 这样逻辑就完事了？？？
-	// TODO: 进行并发操作 raft状态的改造
-	if args.CandidateTerm < rf.myTerm || len(rf.curVoteTarget) != 0 ||
-		rf.logs[len(rf.logs)-1].term > args.CandidateTerm || len(rf.logs)-1 > args.LastLogIdx {
+	rf.mu.Lock()
+	myTerm := rf.myTerm
+	curVoteTarget := rf.curVoteTarget
+	lastLog := rf.logs[len(rf.logs)-1]
+	lastLogIdx := len(rf.logs) - 1
+	reply.CurTerm = myTerm
+	rf.mu.Unlock()
+	if args.CandidateTerm < myTerm || len(curVoteTarget) != 0 ||
+		lastLog.term > args.CandidateTerm || lastLogIdx > args.LastLogIdx {
 		reply.IsVote = false
 		return
 	}
+	rf.setCurVoteTarget(args.CandidateID)
 	reply.IsVote = true
 	return
 }
@@ -198,6 +263,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 //
 type AppendEntriesArgs struct {
 	// Your data here (2A, 2B).
+	LeaderID   string
+	LeaderTerm uint64
+	PreLogIdx  int
+	PreLogTerm int64
+	LastCommit int
+	Logs       []wal
 }
 
 //
@@ -205,13 +276,29 @@ type AppendEntriesArgs struct {
 //
 type AppendEntriesReply struct {
 	// Your data here (2A).
+	CurrTerm uint64
+	IsOK     bool
 }
 
 //
 // 附加日志/心跳 rpc 的执行体
 //
-func (rf *Raft) RequestAppendEntries(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) RequestAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here (2A, 2B).
+	myTerm := rf.getMyTerm()
+	if args.LeaderTerm < myTerm {
+		reply.IsOK = false
+		reply.CurrTerm = myTerm
+		return
+	}
+	if len(args.Logs) == 0 {
+		// 处理心跳
+		reply.IsOK = false
+		reply.CurrTerm = myTerm
+		// 重置 选举超时计时器
+		rf.electionTimer.Reset(getElectionTimeOut())
+		return
+	}
 }
 
 // 附加日志/心跳 rpc 的发送函数
@@ -284,7 +371,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.closeChan = make(chan struct{})
 	// Your initialization code here (2A, 2B, 2C).
 	rf.id = uuid.New().String() // TODO: 应该去除特殊字符
-	rf.logs = make([]log, 0)
+	rf.logs = make([]wal, 0)
 	rf.myTerm = 1 // 初始化的时候 大家都认为自己是1,除非 被快照覆盖
 	go rf.election()
 	go rf.heartbeat()
@@ -298,37 +385,43 @@ func getElectionTimeOut() time.Duration {
 	return time.Duration(rand.Intn(500)+500) * time.Millisecond
 }
 func (rf *Raft) election() {
-	c := time.NewTimer(getElectionTimeOut())
-	defer c.Stop()
+	rf.electionTimer = time.NewTimer(getElectionTimeOut())
+	defer rf.electionTimer.Stop()
 	for {
 		select {
-		case <-c.C:
+		case <-rf.electionTimer.C:
+			rf.mu.Lock()
 			rf.myTerm++
-			// TODO: 直接操作 raft 状态是否会有并发问题?
+			rf.curVoteTarget = ""
 			voteArgs, voteRes := RequestVoteArgs{
 				CandidateID:   rf.id,
 				CandidateTerm: rf.myTerm,
 				LastLogIdx:    len(rf.logs) - 1,
 				LastLogTerm:   rf.logs[len(rf.logs)-1].term,
 			}, RequestVoteReply{}
-			for i := range rf.peers {
-				if i == rf.me {
+			me := rf.me
+			myTerm := rf.myTerm
+			peersLen := len(rf.peers)
+			rf.mu.Unlock()
+			for i := 0; i < peersLen; i++ {
+				if i == me {
 					continue
 				}
 				if ok := rf.sendRequestVote(i, &voteArgs, &voteRes); ok {
-					if voteRes.CurTerm > rf.myTerm {
-						rf.myTerm = voteRes.CurTerm
+					if voteRes.CurTerm > myTerm {
+						rf.setMyTerm(voteRes.CurTerm)
 						continue
 					}
 					if voteRes.IsVote {
-						rf.isLeader = true
+						// TODO: 角色变更 这里需要重构一下
+						rf.setIsLeader(1)
 					}
 				}
 			}
 		case <-rf.closeChan:
 			return
 		}
-		c.Reset(getElectionTimeOut())
+		rf.electionTimer.Reset(getElectionTimeOut())
 	}
 }
 
@@ -337,7 +430,18 @@ func (rf *Raft) heartbeat() {
 	for {
 		select {
 		case <-c.C:
-			// TODO: 发送心跳
+			rf.mu.Lock()
+			id := rf.id
+			myTerm := rf.myTerm
+			peersLen := len(rf.peers)
+			rf.mu.Unlock()
+			for i := 0; i < peersLen; i++ {
+				reply := &AppendEntriesReply{}
+				rf.sendAppendEntries(i, &AppendEntriesArgs{
+					LeaderID:   id,
+					LeaderTerm: myTerm,
+				}, reply)
+			}
 		case <-rf.closeChan:
 			return
 		}
