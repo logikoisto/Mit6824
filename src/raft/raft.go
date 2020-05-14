@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"github.com/google/uuid"
 	"math/rand"
 	"sync"
@@ -66,7 +67,7 @@ type Raft struct {
 	curVoteTarget atomic.Value // 当一次投票给node的ID
 	myTerm        int64        // 最后的已知的任期
 	// TODO: 是否存在 一个并发安全的 list?
-	logs          []wal       // 日志条目
+	logs          []Wal       // 日志条目
 	lastApplyIdx  int         // 最后应用于状态机的日志索引
 	lastCommitIdx int         // 最后的提交日志索引
 	electionTimer *time.Timer // 用于选举的定时器
@@ -81,7 +82,7 @@ func (rf *Raft) isLeader() bool {
 
 // 只有从一个候选人才能变更为领导者
 func (rf *Raft) coronation() bool {
-	return atomic.CompareAndSwapInt32(&rf.roles, 2, 1)
+	return atomic.CompareAndSwapInt32(&rf.roles, 2, 3)
 }
 
 func (rf *Raft) isFollower() bool {
@@ -107,7 +108,7 @@ func (rf *Raft) getLastCommitIdx() int {
 	return rf.lastCommitIdx
 }
 
-func (rf *Raft) setLogs(los []wal) {
+func (rf *Raft) setLogs(los []Wal) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.logs = los
@@ -149,7 +150,7 @@ func (rf *Raft) setId(id string) {
 	rf.id.Store(id)
 }
 
-type wal struct {
+type Wal struct {
 	term int64
 	cmd  string
 }
@@ -229,6 +230,8 @@ type RequestVoteReply struct {
 
 //
 // example RequestVote RPC handler.
+// 问题应该就在 投票这里吗??  草 果然不容易啊 啊
+// TODO: 解决网络失败导致集群死锁问题
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
@@ -236,7 +239,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	myTerm := rf.getMyTerm()
 	curVoteTarget := rf.getCurVoteTarget()
-	var lastLog wal
+	var lastLog Wal
 	var lastLogIdx int
 	// TODO: 对获取最后的日志这里应该进行抽象
 	if len(rf.logs) > 0 {
@@ -244,15 +247,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		lastLogIdx = len(rf.logs) - 1
 	}
 	rf.mu.Unlock()
-
 	reply.CurTerm = myTerm
 	if args.CandidateTerm < myTerm || len(curVoteTarget) != 0 ||
 		lastLog.term > args.CandidateTerm || lastLogIdx > args.LastLogIdx {
 		reply.IsVote = false
 		return
 	}
+	rf.setMyTerm(args.CandidateTerm)
 	rf.setCurVoteTarget(args.CandidateID)
+	// 在投票后重新等待一个选举超时时间,也就是说 选票会抑制跟随者成为候选者,如果节点投票相当于放弃了最近一次的竞选
+	rf.mu.Lock()
+	rf.electionTimer.Reset(getElectionTimeOut())
+	rf.mu.Unlock()
 	reply.IsVote = true
+	fmt.Printf("%s投票给:%s\n", rf.getId(), rf.getCurVoteTarget())
 	return
 }
 
@@ -300,7 +308,7 @@ type AppendEntriesArgs struct {
 	PreLogIdx  int
 	PreLogTerm int64
 	LastCommit int
-	Logs       []wal
+	Logs       []interface{}
 }
 
 //
@@ -347,7 +355,7 @@ func (rf *Raft) RequestAppendEntries(args *AppendEntriesArgs, reply *AppendEntri
 
 // 附加日志/心跳 rpc 的发送函数
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	ok := rf.peers[server].Call("Raft.RequestAppendEntries", args, reply)
 	return ok
 }
 
@@ -416,8 +424,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.setId(uuid.New().String()) // TODO: 应该去除特殊字符
 	rf.setCurVoteTarget("")       // TODO: 应先从持久化数据中恢复
-	rf.logs = make([]wal, 0)
+	rf.logs = make([]Wal, 0)
 	rf.myTerm = 1 // 初始化的时候 大家都认为自己是1,除非 被快照覆盖
+	rf.following()
 	go rf.election()
 	go rf.heartbeat()
 	// initialize from state persisted before a crash
@@ -436,6 +445,9 @@ func (rf *Raft) election() {
 		select {
 		case <-rf.electionTimer.C:
 			rf.mu.Lock()
+			if !rf.setCandidate() { //成为候选人
+				continue
+			}
 			rf.incrMyTerm()
 			rf.setCurVoteTarget("")
 			myTerm := rf.getMyTerm()
@@ -453,6 +465,7 @@ func (rf *Raft) election() {
 			me := rf.me
 			peersLen := len(rf.peers)
 			rf.mu.Unlock()
+			res := make([]bool, peersLen)
 			for i := 0; i < peersLen; i++ {
 				if i == me {
 					continue
@@ -463,11 +476,21 @@ func (rf *Raft) election() {
 						continue
 					}
 					if voteRes.IsVote {
-						for !rf.coronation() {
-						} // CAS
-						rf.initLeader()
+						res[i] = true
 					}
 				}
+			}
+			count := 0
+			for _, v := range res {
+				if v {
+					count++
+				}
+			}
+			if count >= (peersLen-1)/2 {
+				fmt.Printf("成为领导者:%s\n", rf.getId())
+				for !rf.coronation() {
+				} // CAS
+				rf.initLeader()
 			}
 		case <-rf.closeChan:
 			return
@@ -495,6 +518,7 @@ func (rf *Raft) heartbeat() {
 					rf.sendAppendEntries(i, &AppendEntriesArgs{
 						LeaderID:   id,
 						LeaderTerm: myTerm,
+						Logs:       make([]interface{}, 0),
 					}, reply)
 				}
 			}
