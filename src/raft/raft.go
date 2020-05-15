@@ -161,10 +161,8 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
-	rf.mu.Lock()
 	term = int(rf.getMyTerm())
 	isleader = rf.isLeader()
-	rf.mu.Unlock()
 	return term, isleader
 }
 
@@ -448,6 +446,7 @@ func (rf *Raft) election() {
 			if !rf.setCandidate() { //成为候选人
 				continue
 			}
+			fmt.Printf("%s成为候选人\n", rf.getId())
 			rf.incrMyTerm()
 			rf.setCurVoteTarget("")
 			myTerm := rf.getMyTerm()
@@ -466,10 +465,12 @@ func (rf *Raft) election() {
 			peersLen := len(rf.peers)
 			rf.mu.Unlock()
 			res := make([]bool, peersLen)
+			res[me] = true // 候选人会投自己一票
 			for i := 0; i < peersLen; i++ {
 				if i == me {
 					continue
 				}
+				fmt.Printf("%s发起投票\n", rf.getId())
 				if ok := rf.sendRequestVote(i, &voteArgs, &voteRes); ok {
 					if voteRes.CurTerm > myTerm {
 						rf.setMyTerm(voteRes.CurTerm)
@@ -486,7 +487,8 @@ func (rf *Raft) election() {
 					count++
 				}
 			}
-			if count >= (peersLen-1)/2 {
+			fmt.Printf("%s获得选票%+v\n", rf.getId(), res)
+			if count >= (peersLen)/2+1 {
 				fmt.Printf("成为领导者:%s\n", rf.getId())
 				for !rf.coronation() {
 				} // CAS
