@@ -103,14 +103,14 @@ func (rf *Raft) setCandidate() bool {
 }
 
 func (rf *Raft) getLastCommitIdx() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
 	return rf.lastCommitIdx
 }
 
 func (rf *Raft) setLogs(los []Wal) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
 	rf.logs = los
 }
 func (rf *Raft) setMyTerm(term int64) {
@@ -125,8 +125,8 @@ func (rf *Raft) setCurVoteTarget(vote string) {
 }
 
 func (rf *Raft) setLastCommitIdx(lastCommitIdx int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
 	rf.lastCommitIdx = lastCommitIdx
 }
 
@@ -137,8 +137,8 @@ func (rf *Raft) incrMyTerm() int64 {
 	return atomic.AddInt64(&rf.myTerm, 1)
 }
 func (rf *Raft) getMe() int {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	//rf.mu.Lock()
+	//defer rf.mu.Unlock()
 	return rf.me
 }
 
@@ -234,7 +234,7 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	// TODO: 考虑使用 Percolator 模型原子的更新多个变量?
-	rf.mu.Lock()
+	//rf.mu.Lock()
 	myTerm := rf.getMyTerm()
 	curVoteTarget := rf.getCurVoteTarget()
 	var lastLog Wal
@@ -244,7 +244,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		lastLog = rf.logs[len(rf.logs)-1]
 		lastLogIdx = len(rf.logs) - 1
 	}
-	rf.mu.Unlock()
+	//rf.mu.Unlock()
 	reply.CurTerm = myTerm
 	if args.CandidateTerm < myTerm || len(curVoteTarget) != 0 ||
 		lastLog.term > args.CandidateTerm || lastLogIdx > args.LastLogIdx {
@@ -254,9 +254,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.setMyTerm(args.CandidateTerm)
 	rf.setCurVoteTarget(args.CandidateID)
 	// 在投票后重新等待一个选举超时时间,也就是说 选票会抑制跟随者成为候选者,如果节点投票相当于放弃了最近一次的竞选
-	rf.mu.Lock()
 	rf.electionTimer.Reset(getElectionTimeOut())
-	rf.mu.Unlock()
 	reply.IsVote = true
 	fmt.Printf("%s投票给:%s\n", rf.getId(), rf.getCurVoteTarget())
 	return
@@ -331,22 +329,18 @@ func (rf *Raft) RequestAppendEntries(args *AppendEntriesArgs, reply *AppendEntri
 	}
 	if len(args.Logs) == 0 {
 		// 如果 请求的任期更高 那么就更新自己认为的leader节点
-		if args.LeaderTerm > myTerm {
-			rf.mu.Lock()
-			rf.following()
-			rf.setCurVoteTarget(args.LeaderID)
-			// 重置 选举超时计时器
-			rf.electionTimer.Reset(getElectionTimeOut())
-			rf.mu.Unlock()
-			reply.IsOK = false
+		if args.LeaderTerm >= myTerm {
+			//rf.mu.Lock()
+			if args.LeaderTerm > myTerm {
+				rf.following()
+				rf.setCurVoteTarget(args.LeaderID)
+			}
+			reply.IsOK = true
 			reply.CurrTerm = myTerm
+			rf.electionTimer.Reset(getElectionTimeOut())
+			//rf.mu.Unlock()
 			return
 		}
-		// 处理心跳
-		rf.mu.Lock()
-		// 重置 选举超时计时器
-		rf.electionTimer.Reset(getElectionTimeOut())
-		rf.mu.Unlock()
 		return
 	}
 }
@@ -450,20 +444,20 @@ func (rf *Raft) election() {
 			rf.incrMyTerm()
 			rf.setCurVoteTarget("")
 			myTerm := rf.getMyTerm()
+			me := rf.me
 			var lastLogIdx int
 			var lastLogTerm int64
+			peersLen := len(rf.peers)
 			if len(rf.logs) > 0 {
 				lastLogIdx, lastLogTerm = len(rf.logs)-1, rf.logs[len(rf.logs)-1].term
 			}
+			rf.mu.Unlock()
 			voteArgs, voteRes := RequestVoteArgs{
 				CandidateID:   rf.getId(),
 				CandidateTerm: myTerm,
 				LastLogIdx:    lastLogIdx,
 				LastLogTerm:   lastLogTerm,
 			}, RequestVoteReply{}
-			me := rf.me
-			peersLen := len(rf.peers)
-			rf.mu.Unlock()
 			res := make([]bool, peersLen)
 			res[me] = true // 候选人会投自己一票
 			for i := 0; i < peersLen; i++ {
@@ -494,13 +488,11 @@ func (rf *Raft) election() {
 				} // CAS
 				rf.initLeader()
 			}
+			rf.electionTimer.Reset(getElectionTimeOut())
+			//rf.mu.Unlock()
 		case <-rf.closeChan:
 			return
 		}
-		// TODO:操作 选举计时器 这里加锁 可以优化
-		rf.mu.Lock()
-		rf.electionTimer.Reset(getElectionTimeOut())
-		rf.mu.Unlock()
 	}
 }
 
@@ -510,19 +502,29 @@ func (rf *Raft) heartbeat() {
 		select {
 		case <-c.C:
 			if rf.isLeader() {
-				rf.mu.Lock()
+				//rf.mu.Lock()
 				id := rf.getId()
 				myTerm := rf.getMyTerm()
 				peersLen := len(rf.peers)
-				rf.mu.Unlock()
+				me := rf.me
+				res := make([]bool, peersLen)
+				res[me] = true
 				for i := 0; i < peersLen; i++ {
+					if i == me {
+						continue
+					}
 					reply := &AppendEntriesReply{}
 					rf.sendAppendEntries(i, &AppendEntriesArgs{
 						LeaderID:   id,
 						LeaderTerm: myTerm,
 						Logs:       make([]interface{}, 0),
 					}, reply)
+					res[i] = reply.IsOK
+					if reply.CurrTerm > myTerm {
+						rf.following()
+					}
 				}
+				//rf.mu.Unlock()
 			}
 		case <-rf.closeChan:
 			return

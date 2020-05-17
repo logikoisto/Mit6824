@@ -19,7 +19,7 @@ import "sync"
 // (much more than the paper's range of timeouts).
 const RaftElectionTimeout = 1000 * time.Millisecond
 
-func TestInitialElection2C(t *testing.T) {
+func TestInitialElection2A(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
@@ -56,33 +56,41 @@ func TestReElection2A(t *testing.T) {
 
 	leader1 := cfg.checkOneLeader()
 	// if the leader disconnects, a new one should be elected.
+	fmt.Println("000000000000000000000000000000000000000000000000")
 	cfg.disconnect(leader1)
 	cfg.checkOneLeader()
+	fmt.Println("111111111111111111111111111111111111111111111111")
 	/* TODO: 通过添加日志 定位2a的问题, 解决了昨天获得状态导致死锁问题
 	1. 二次选举时间超过5秒
 	2. 老领导重新加入集群,状态需要变更
 	*/
-	fmt.Println("?")
+	/*
+		   TODO: 发现是并发问题 对于这种现象不明确 差异无法对比 直接进行演绎推理
+					1. review 代码 从逻辑出发 分析可能的问题 并在关键处打印日志
+					2. 网络分区后 无法选举处leader
+					3. 不满足法定人数时不能选举出 领导
+	*/
+	fmt.Println("222222222222222222222222222222222222222222222222")
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader.
 	cfg.connect(leader1)
 	leader2 := cfg.checkOneLeader()
-
+	fmt.Println("3")
 	// if there's no quorum, no leader should
 	// be elected.
 	cfg.disconnect(leader2)
 	cfg.disconnect((leader2 + 1) % servers)
 	time.Sleep(2 * RaftElectionTimeout)
 	cfg.checkNoLeader()
-
+	fmt.Println("4")
 	// if a quorum arises, it should elect a leader.
 	cfg.connect((leader2 + 1) % servers)
 	cfg.checkOneLeader()
-
+	fmt.Println("5")
 	// re-join of last node shouldn't prevent leader from existing.
 	cfg.connect(leader2)
 	cfg.checkOneLeader()
-
+	fmt.Println("6")
 	cfg.end()
 }
 
