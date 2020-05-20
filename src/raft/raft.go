@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"github.com/google/uuid"
 	"math/rand"
 	"sync"
@@ -50,6 +49,7 @@ type ApplyMsg struct {
 //
 // A Go object implementing a single Raft peer.
 //
+// TODO: 对raft 各种关键行为的操作 没有保证原子性
 type Raft struct {
 	// TODO: 这里可以该成读写锁 进一步优化
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -77,7 +77,7 @@ func (rf *Raft) initLeader() {
 	// TODO: 初始化 leader 相关数据状态
 }
 func (rf *Raft) isLeader() bool {
-	return atomic.LoadInt32(&rf.roles) == 3
+	return atomic.CompareAndSwapInt32(&rf.roles, 3, 3)
 }
 
 // 只有从一个候选人才能变更为领导者
@@ -158,12 +158,8 @@ type Wal struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	var term int
-	var isleader bool
 	// Your code here (2A).
-	term = int(rf.getMyTerm())
-	isleader = rf.isLeader()
-	return term, isleader
+	return int(rf.getMyTerm()), rf.isLeader()
 }
 
 //
@@ -229,14 +225,16 @@ type RequestVoteReply struct {
 //
 // example RequestVote RPC handler.
 // 问题应该就在 投票这里吗??  草 果然不容易啊 啊
-// TODO: 解决网络失败导致集群死锁问题
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	// TODO: 考虑使用 Percolator 模型原子的更新多个变量?
-	//rf.mu.Lock()
 	myTerm := rf.getMyTerm()
-	curVoteTarget := rf.getCurVoteTarget()
+	// curVoteTarget := rf.getCurVoteTarget()
+	reply.CurTerm = myTerm
+	if args.CandidateTerm < myTerm {
+		reply.IsVote = false
+		return
+	}
 	var lastLog Wal
 	var lastLogIdx int
 	// TODO: 对获取最后的日志这里应该进行抽象
@@ -245,18 +243,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		lastLogIdx = len(rf.logs) - 1
 	}
 	//rf.mu.Unlock()
-	reply.CurTerm = myTerm
-	if args.CandidateTerm < myTerm || len(curVoteTarget) != 0 ||
-		lastLog.term > args.CandidateTerm || lastLogIdx > args.LastLogIdx {
+	if lastLog.term > args.CandidateTerm /*|| len(curVoteTarget) != 0*/ || lastLogIdx > args.LastLogIdx {
 		reply.IsVote = false
 		return
 	}
+	rf.following()
 	rf.setMyTerm(args.CandidateTerm)
 	rf.setCurVoteTarget(args.CandidateID)
 	// 在投票后重新等待一个选举超时时间,也就是说 选票会抑制跟随者成为候选者,如果节点投票相当于放弃了最近一次的竞选
 	rf.electionTimer.Reset(getElectionTimeOut())
 	reply.IsVote = true
-	fmt.Printf("%s投票给:%s\n", rf.getId(), rf.getCurVoteTarget())
 	return
 }
 
@@ -327,20 +323,16 @@ func (rf *Raft) RequestAppendEntries(args *AppendEntriesArgs, reply *AppendEntri
 		reply.CurrTerm = myTerm
 		return
 	}
-	if len(args.Logs) == 0 {
+	if len(args.Logs) == 0 && args.LeaderTerm >= myTerm {
 		// 如果 请求的任期更高 那么就更新自己认为的leader节点
-		if args.LeaderTerm >= myTerm {
-			//rf.mu.Lock()
-			if args.LeaderTerm > myTerm {
-				rf.following()
-				rf.setCurVoteTarget(args.LeaderID)
-			}
-			reply.IsOK = true
-			reply.CurrTerm = myTerm
-			rf.electionTimer.Reset(getElectionTimeOut())
-			//rf.mu.Unlock()
-			return
+		if args.LeaderTerm > myTerm {
+			rf.following()
+			rf.setCurVoteTarget(args.LeaderID)
+			rf.setMyTerm(args.LeaderTerm)
 		}
+		reply.IsOK = true
+		reply.CurrTerm = myTerm
+		rf.electionTimer.Reset(getElectionTimeOut())
 		return
 	}
 }
@@ -428,7 +420,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 func getElectionTimeOut() time.Duration {
 	rand.Seed(time.Now().UnixNano())
-	return time.Duration(rand.Intn(500)+500) * time.Millisecond
+	return time.Duration(rand.Intn(300)+500) * time.Millisecond
 }
 func (rf *Raft) election() {
 	rf.electionTimer = time.NewTimer(getElectionTimeOut())
@@ -436,11 +428,9 @@ func (rf *Raft) election() {
 	for {
 		select {
 		case <-rf.electionTimer.C:
-			rf.mu.Lock()
 			if !rf.setCandidate() { //成为候选人
 				continue
 			}
-			fmt.Printf("%s成为候选人\n", rf.getId())
 			rf.incrMyTerm()
 			rf.setCurVoteTarget("")
 			myTerm := rf.getMyTerm()
@@ -451,7 +441,6 @@ func (rf *Raft) election() {
 			if len(rf.logs) > 0 {
 				lastLogIdx, lastLogTerm = len(rf.logs)-1, rf.logs[len(rf.logs)-1].term
 			}
-			rf.mu.Unlock()
 			voteArgs, voteRes := RequestVoteArgs{
 				CandidateID:   rf.getId(),
 				CandidateTerm: myTerm,
@@ -464,11 +453,12 @@ func (rf *Raft) election() {
 				if i == me {
 					continue
 				}
-				fmt.Printf("%s发起投票\n", rf.getId())
 				if ok := rf.sendRequestVote(i, &voteArgs, &voteRes); ok {
 					if voteRes.CurTerm > myTerm {
+						// 如果 他认为的民众比他任期更高 那么他就回退到跟随者
 						rf.setMyTerm(voteRes.CurTerm)
-						continue
+						rf.following()
+						goto f
 					}
 					if voteRes.IsVote {
 						res[i] = true
@@ -481,50 +471,43 @@ func (rf *Raft) election() {
 					count++
 				}
 			}
-			fmt.Printf("%s获得选票%+v\n", rf.getId(), res)
 			if count >= (peersLen)/2+1 {
-				fmt.Printf("成为领导者:%s\n", rf.getId())
 				for !rf.coronation() {
 				} // CAS
 				rf.initLeader()
 			}
-			rf.electionTimer.Reset(getElectionTimeOut())
-			//rf.mu.Unlock()
 		case <-rf.closeChan:
 			return
 		}
+	f:
+		rf.electionTimer.Reset(getElectionTimeOut())
 	}
 }
-
 func (rf *Raft) heartbeat() {
-	c := time.NewTicker(100 * time.Millisecond)
+	c := time.NewTicker(200 * time.Millisecond)
 	for {
 		select {
 		case <-c.C:
 			if rf.isLeader() {
-				//rf.mu.Lock()
+
 				id := rf.getId()
 				myTerm := rf.getMyTerm()
 				peersLen := len(rf.peers)
 				me := rf.me
-				res := make([]bool, peersLen)
-				res[me] = true
 				for i := 0; i < peersLen; i++ {
 					if i == me {
 						continue
 					}
 					reply := &AppendEntriesReply{}
-					rf.sendAppendEntries(i, &AppendEntriesArgs{
+					res := rf.sendAppendEntries(i, &AppendEntriesArgs{
 						LeaderID:   id,
 						LeaderTerm: myTerm,
 						Logs:       make([]interface{}, 0),
 					}, reply)
-					res[i] = reply.IsOK
-					if reply.CurrTerm > myTerm {
+					if res && reply.CurrTerm > myTerm {
 						rf.following()
 					}
 				}
-				//rf.mu.Unlock()
 			}
 		case <-rf.closeChan:
 			return
