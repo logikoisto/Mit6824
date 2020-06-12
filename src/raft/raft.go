@@ -18,8 +18,9 @@ package raft
 //
 
 import (
-	"github.com/google/uuid"
+	"fmt"
 	"math/rand"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -75,6 +76,7 @@ type Raft struct {
 
 func (rf *Raft) initLeader() {
 	// TODO: 初始化 leader 相关数据状态
+	rf.setCurVoteTarget(rf.getId())
 }
 func (rf *Raft) isLeader() bool {
 	return atomic.CompareAndSwapInt32(&rf.roles, 3, 3)
@@ -224,14 +226,17 @@ type RequestVoteReply struct {
 
 //
 // example RequestVote RPC handler.
-// 问题应该就在 投票这里吗??  草 果然不容易啊 啊
 //
+// TODO: 这里可能存在 选票瓜分时 同时竞选成为领导的问题 草你妈的  这一周也没搞定 气死哎呀
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	myTerm := rf.getMyTerm()
-	// curVoteTarget := rf.getCurVoteTarget()
-	reply.CurTerm = myTerm
-	if args.CandidateTerm < myTerm {
+	//curVoteTarget := rf.getCurVoteTarget()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.CurTerm = rf.getMyTerm()
+	// 如果相同 那么说明同时超时 彼此肯定不投票 选票被瓜分
+	if args.CandidateTerm <= reply.CurTerm {
 		reply.IsVote = false
 		return
 	}
@@ -247,10 +252,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.IsVote = false
 		return
 	}
-	rf.following()
 	rf.setMyTerm(args.CandidateTerm)
 	rf.setCurVoteTarget(args.CandidateID)
+	rf.following()
 	// 在投票后重新等待一个选举超时时间,也就是说 选票会抑制跟随者成为候选者,如果节点投票相当于放弃了最近一次的竞选
+	fmt.Println(rf.getId(), "在任期", reply.CurTerm, "投票给", args.CandidateID, "后任期变为", rf.getMyTerm())
 	rf.electionTimer.Reset(getElectionTimeOut())
 	reply.IsVote = true
 	return
@@ -317,10 +323,12 @@ type AppendEntriesReply struct {
 //
 func (rf *Raft) RequestAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	myTerm := rf.getMyTerm()
+	reply.CurrTerm = myTerm
 	if args.LeaderTerm < myTerm {
 		reply.IsOK = false
-		reply.CurrTerm = myTerm
 		return
 	}
 	if len(args.Logs) == 0 && args.LeaderTerm >= myTerm {
@@ -331,7 +339,6 @@ func (rf *Raft) RequestAppendEntries(args *AppendEntriesArgs, reply *AppendEntri
 			rf.setMyTerm(args.LeaderTerm)
 		}
 		reply.IsOK = true
-		reply.CurrTerm = myTerm
 		rf.electionTimer.Reset(getElectionTimeOut())
 		return
 	}
@@ -339,6 +346,8 @@ func (rf *Raft) RequestAppendEntries(args *AppendEntriesArgs, reply *AppendEntri
 
 // 附加日志/心跳 rpc 的发送函数
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	ok := rf.peers[server].Call("Raft.RequestAppendEntries", args, reply)
 	return ok
 }
@@ -406,8 +415,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.closeChan = make(chan struct{})
 	// Your initialization code here (2A, 2B, 2C).
-	rf.setId(uuid.New().String()) // TODO: 应该去除特殊字符
-	rf.setCurVoteTarget("")       // TODO: 应先从持久化数据中恢复
+	rf.setId(strconv.Itoa(me))            // TODO: 应该去除特殊字符
+	rf.setCurVoteTarget(strconv.Itoa(me)) // TODO: 应先从持久化数据中恢复
 	rf.logs = make([]Wal, 0)
 	rf.myTerm = 1 // 初始化的时候 大家都认为自己是1,除非 被快照覆盖
 	rf.following()
@@ -420,8 +429,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 func getElectionTimeOut() time.Duration {
 	rand.Seed(time.Now().UnixNano())
-	return time.Duration(rand.Intn(300)+500) * time.Millisecond
+	ts := time.Duration(300+(rand.Int63()%200)) * time.Millisecond
+	return ts
 }
+
 func (rf *Raft) election() {
 	rf.electionTimer = time.NewTimer(getElectionTimeOut())
 	defer rf.electionTimer.Stop()
@@ -460,9 +471,7 @@ func (rf *Raft) election() {
 						rf.following()
 						goto f
 					}
-					if voteRes.IsVote {
-						res[i] = true
-					}
+					res[i] = voteRes.IsVote
 				}
 			}
 			count := 0
@@ -474,6 +483,7 @@ func (rf *Raft) election() {
 			if count >= (peersLen)/2+1 {
 				for !rf.coronation() {
 				} // CAS
+				fmt.Println(rf.getId(), "在任期", rf.getMyTerm(), "成为领导者", "获得选票", res, "状态是", rf.roles)
 				rf.initLeader()
 			}
 		case <-rf.closeChan:
@@ -483,30 +493,47 @@ func (rf *Raft) election() {
 		rf.electionTimer.Reset(getElectionTimeOut())
 	}
 }
+
+// TODO:expected one leader, got none  无法在 5秒内选举出leader 明天 还是去看看论文吧  这个时候 我怀疑自己的理解有问题了 草 还是不能通过 哭唧唧
 func (rf *Raft) heartbeat() {
-	c := time.NewTicker(200 * time.Millisecond)
+	c := time.NewTicker(100 * time.Millisecond)
 	for {
 		select {
 		case <-c.C:
 			if rf.isLeader() {
-
 				id := rf.getId()
 				myTerm := rf.getMyTerm()
 				peersLen := len(rf.peers)
 				me := rf.me
+				res := make([]bool, len(rf.peers))
+				res[me] = true
 				for i := 0; i < peersLen; i++ {
 					if i == me {
 						continue
 					}
 					reply := &AppendEntriesReply{}
-					res := rf.sendAppendEntries(i, &AppendEntriesArgs{
+					ret := rf.sendAppendEntries(i, &AppendEntriesArgs{
 						LeaderID:   id,
 						LeaderTerm: myTerm,
 						Logs:       make([]interface{}, 0),
 					}, reply)
-					if res && reply.CurrTerm > myTerm {
+					res[i] = ret
+					if ret && reply.CurrTerm > myTerm {
+						rf.setMyTerm(reply.CurrTerm)
 						rf.following()
+						rf.electionTimer.Reset(getElectionTimeOut())
+						break
 					}
+				}
+				count := 0
+				for _, v := range res {
+					if v {
+						count++
+					}
+				}
+				if count < (peersLen)/2+1 {
+					rf.following()
+					rf.electionTimer.Reset(getElectionTimeOut())
 				}
 			}
 		case <-rf.closeChan:
